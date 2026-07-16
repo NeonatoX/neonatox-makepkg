@@ -100,9 +100,7 @@ error() {
 # Variables generales
 PKGBUILDSHA256=$(sha256sum PKGBUILD | sed 's/ PKGBUILD//g')
 BUILDDATE=$(date +%s)
-# Limitacion temporal en cueanto de desarrolla el soporte para paquetes Split
-PACKAGETYPE=$(cat PKGBUILD | grep "package()" | sed 's/ {//g') 
-## Basada en la configuracion por defecto del makepkg original
+# Detectar tipo de paquete
 CARCH="$(uname -m)"
 CHOST="$(echo "$MACHTYPE")"
 BUILDENV=(!distcc color !ccache check !sign)
@@ -111,29 +109,20 @@ OPTIONS=(strip docs !libtool !staticlibs emptydirs zipman purge debug lto)
 # Cargando PKGBUILD...
 source PKGBUILD
 
-# Verificar la condición
-if [ "$PACKAGETYPE" != "package()" ]; then
-    error "$(basename $0) only supports non-split PKGBUILD files..."
-    exit 1
-fi
-
 SPLITPACKAGE=""
 # 1) Si hay función package() definida -> paquete simple
 if declare -f package >/dev/null 2>&1; then
     SPLITPACKAGE=""
 else
     # 2) Si hay funciones package_<name> ya declaradas -> tomar nombres
-    #    (esto cubre PKGBUILD que definen package_... literalmente)
     mapfile -t _pkgfuncs < <(declare -F | awk '{print $3}' | grep -E '^package_' || true)
     if [[ ${#_pkgfuncs[@]} -gt 0 ]]; then
-        # Extraer sufijos "package_foo" -> "foo"
         for f in "${_pkgfuncs[@]}"; do
             SPLITPACKAGE+=" ${f#package_}"
         done
     else
         # 3) Si pkgname es un array con más de 1 elemento -> split package
         if eval '[[ $(declare -p pkgname 2>/dev/null) =~ "declare -a" ]]' && [[ "${#pkgname[@]}" -gt 1 ]]; then
-            # expandir los nombres tal como quedaron tras source PKGBUILD
             for p in "${pkgname[@]}"; do
                 SPLITPACKAGE+=" $p"
             done
@@ -861,39 +850,208 @@ else
 fi
 
 # Ejecutar package()
-if declare -f package >/dev/null; then
-    log "Ejecutando package()..."
+pkg_context="$BUILDDIR"
+if ! declare -f build >/dev/null; then
+    pkg_context="$SRCDIR"
+fi
 
-    # Si existe build(), usar $BUILDDIR, si no, usar $SRCDIR
-    pkg_context="$BUILDDIR"
-    if ! declare -f build >/dev/null; then
-        pkg_context="$SRCDIR"
-    fi
-
+if [[ "$SPLITPACKAGE" != "" ]]; then
+    log "Detectado paquete split: $SPLITPACKAGE"
+    
+    # Generar metadata base una vez (para .BUILDINFO)
+    log "Generando metadatos (.BUILDINFO)..."
+    generate_pkgbuild > "$PKGDIR/.BUILDINFO"
+    
+    # Función auxiliar para capturar metadata de un paquete
+    capture_pkg_metadata() {
+        local _pkgname="$1"
+        local _outfile="$2"
+        
+        # Ejecutar en subshell y capturar variables a archivo
+        # IMPORTANTE: usar () para crear subshell, no {} (que persiste en el shell actual)
+        (
+            arch-meson() { :; }; cd() { :; }; cp() { :; }; cmake() { :; }
+            diff(){ :; }; find(){ :; }; file(){ :; }; install() { :; }
+            make() { :; }; meson() { :; }; mkdir() { :; }; mv() { :; }
+            ln() { :; }; patch(){ :; }; rm() { :; }; strip() { :; }
+            _install_component() { :; }; _pick() { :; }
+            pkgdir="/tmp/pkgdir"; srcdir="/tmp/srcdir"; _archive="/tmp/archive"
+            startdir="/tmp/startdir"; file="/tmp/file"; builddir="/tmp/builddir"
+            "package_$_pkgname" 2>/dev/null
+            # Imprimir variables al final
+            echo "_pkgdesc='${pkgdesc:-}'"
+            if declare -p depends &>/dev/null 2>&1; then
+                declare -p depends | sed "s/declare -a depends=/_depends=(/"
+                echo ")"
+            fi
+            if declare -p optdepends &>/dev/null 2>&1; then
+                declare -p optdepends | sed "s/declare -a optdepends=/_optdepends=(/"
+                echo ")"
+            fi
+            if declare -p provides &>/dev/null 2>&1; then
+                declare -p provides | sed "s/declare -a provides=/_provides=(/"
+                echo ")"
+            fi
+            if declare -p conflicts &>/dev/null 2>&1; then
+                declare -p conflicts | sed "s/declare -a conflicts=/_conflicts=(/"
+                echo ")"
+            fi
+            if declare -p replaces &>/dev/null 2>&1; then
+                declare -p replaces | sed "s/declare -a replaces=/_replaces=(/"
+                echo ")"
+            fi
+            if declare -p license &>/dev/null 2>&1; then
+                declare -p license | sed "s/declare -a license=/_license=(/"
+                echo ")"
+            fi
+        ) > "$_outfile"
+    }
+    
+    # Ejecutar TODAS las funciones package_ en el mismo pkgdir
+    # (como hace makepkg real)
+    _base_pkg="${SPLITPACKAGE%% *}"
+    
+    # Primero, ejecutar el paquete base para organizar archivos con _pick()
+    log "Ejecutando package_$_base_pkg()..."
+    
+    # Capturar metadata del paquete base
+    _metafile=$(mktemp)
+    capture_pkg_metadata "$_base_pkg" "$_metafile"
+    
+    unset -v depends optdepends replaces conflicts provides install license
+    
+    # Ejecutar paquete base
     (
         export srcdir="$SRCDIR"
         export pkgdir="$PKGDIR"
         export startdir="$PWD"
-        cd "$pkg_context"
-        package
+        export pkgname="$_base_pkg"
+        cd "$PKGDIR"
+        "package_$_base_pkg"
     )
+    
+    # Crear directorio para el paquete base
+    _pkg_subdir="$PKGDIR/$_base_pkg"
+    mkdir -p "$_pkg_subdir"
+    
+    # Mover archivos del pkgdir al subdirectorio del paquete base
+    for _f in "$PKGDIR"/*; do
+        [[ -e "$_f" ]] || continue
+        _fname="$(basename "$_f")"
+        [[ "$_fname" == "$_base_pkg" ]] && continue
+        mv "$_f" "$_pkg_subdir/" 2>/dev/null || true
+    done
+    
+    # Generar .PKGINFO para el paquete base
+    log "Generando metadatos para $_base_pkg (.PKGINFO)..."
+    unset -v _pkgdesc _depends _optdepends _provides _conflicts _replaces _license
+    source "$_metafile" 2>/dev/null || true
+    declare -a _depends=() _optdepends=() _provides=() _conflicts=() _replaces=() _license=()
+    _pkg_size=$(du -sb "$_pkg_subdir" 2>/dev/null | cut -f1 || echo 0)
+    cat > "$_pkg_subdir/.PKGINFO" <<EOF
+# Generated by $(basename $0)
+pkgname = $_base_pkg
+pkgbase = ${pkgbase:-$pkgname}
+xdata = pkgtype=pkg
+pkgver = $pkgver-$pkgrel
+pkgdesc = ${_pkgdesc:-${pkgdesc:-}}
+url = $url
+builddate = $BUILDDATE
+packager = ${packager:-$(whoami)}
+size = $_pkg_size
+arch = $CARCH
+EOF
+    [[ "${#_depends[@]}" -gt 0 ]] && for d in "${_depends[@]}"; do echo "depend = $d"; done >> "$_pkg_subdir/.PKGINFO"
+    [[ "${#_optdepends[@]}" -gt 0 ]] && for d in "${_optdepends[@]}"; do echo "optdepend = $d"; done >> "$_pkg_subdir/.PKGINFO"
+    [[ "${#_provides[@]}" -gt 0 ]] && for d in "${_provides[@]}"; do echo "provides = $d"; done >> "$_pkg_subdir/.PKGINFO"
+    [[ "${#_conflicts[@]}" -gt 0 ]] && for d in "${_conflicts[@]}"; do echo "conflicts = $d"; done >> "$_pkg_subdir/.PKGINFO"
+    [[ "${#_replaces[@]}" -gt 0 ]] && for d in "${_replaces[@]}"; do echo "replaces = $d"; done >> "$_pkg_subdir/.PKGINFO"
+    [[ "${#_license[@]}" -gt 0 ]] && for d in "${_license[@]}"; do echo "license = $d"; done >> "$_pkg_subdir/.PKGINFO"
+    rm -f "$_metafile"
+    command -v bsdtar >/dev/null && (cd "$_pkg_subdir" && bsdtar -czf .MTREE --format=mtree --options='!all,use-set,uid,gid,mode,time,size,sha256,link' . 2>/dev/null)
+    cp "$PKGDIR/.BUILDINFO" "$_pkg_subdir/.BUILDINFO" 2>/dev/null || true
+    
+    # Ahora ejecutar cada subpaquete
+    for _pkg in $SPLITPACKAGE; do
+        [[ "$_pkg" == "$_base_pkg" ]] && continue
+        
+        log "Ejecutando package_$_pkg()..."
+        
+        # Capturar metadata
+        _metafile=$(mktemp)
+        capture_pkg_metadata "$_pkg" "$_metafile"
+        
+        # Limpiar variables
+        unset -v depends optdepends replaces conflicts provides install license
+        
+        # Crear directorio para el subpaquete
+        _pkg_subdir="$PKGDIR/$_pkg"
+        mkdir -p "$_pkg_subdir"
+        
+        # Los subpaquetes reciben los archivos organizados por _pick()
+        # _pick() crea subdirectorios basados en el nombre del subpaquete (ej: afc, smb)
+        _pkg_suffix="${_pkg#$_base_pkg-}"
+        if [[ -d "$SRCDIR/$_base_pkg/$_pkg_suffix" ]]; then
+            cp -a "$SRCDIR/$_base_pkg/$_pkg_suffix/." "$_pkg_subdir/" 2>/dev/null || true
+        fi
+        
+        # Generar .PKGINFO
+        log "Generando metadatos para $_pkg (.PKGINFO)..."
+        unset -v _pkgdesc _depends _optdepends _provides _conflicts _replaces _license
+        source "$_metafile" 2>/dev/null || true
+        declare -a _depends=() _optdepends=() _provides=() _conflicts=() _replaces=() _license=()
+        _pkg_size=$(du -sb "$_pkg_subdir" 2>/dev/null | cut -f1 || echo 0)
+        cat > "$_pkg_subdir/.PKGINFO" <<EOF
+# Generated by $(basename $0)
+pkgname = $_pkg
+pkgbase = ${pkgbase:-$pkgname}
+xdata = pkgtype=pkg
+pkgver = $pkgver-$pkgrel
+pkgdesc = ${_pkgdesc:-${pkgdesc:-}}
+url = $url
+builddate = $BUILDDATE
+packager = ${packager:-$(whoami)}
+size = $_pkg_size
+arch = $CARCH
+EOF
+        [[ "${#_depends[@]}" -gt 0 ]] && for d in "${_depends[@]}"; do echo "depend = $d"; done >> "$_pkg_subdir/.PKGINFO"
+        [[ "${#_optdepends[@]}" -gt 0 ]] && for d in "${_optdepends[@]}"; do echo "optdepend = $d"; done >> "$_pkg_subdir/.PKGINFO"
+        [[ "${#_provides[@]}" -gt 0 ]] && for d in "${_provides[@]}"; do echo "provides = $d"; done >> "$_pkg_subdir/.PKGINFO"
+        [[ "${#_conflicts[@]}" -gt 0 ]] && for d in "${_conflicts[@]}"; do echo "conflicts = $d"; done >> "$_pkg_subdir/.PKGINFO"
+        [[ "${#_replaces[@]}" -gt 0 ]] && for d in "${_replaces[@]}"; do echo "replaces = $d"; done >> "$_pkg_subdir/.PKGINFO"
+        [[ "${#_license[@]}" -gt 0 ]] && for d in "${_license[@]}"; do echo "license = $d"; done >> "$_pkg_subdir/.PKGINFO"
+        rm -f "$_metafile"
+        command -v bsdtar >/dev/null && (cd "$_pkg_subdir" && bsdtar -czf .MTREE --format=mtree --options='!all,use-set,uid,gid,mode,time,size,sha256,link' . 2>/dev/null)
+        cp "$PKGDIR/.BUILDINFO" "$_pkg_subdir/.BUILDINFO" 2>/dev/null || true
+    done
 else
-    error "Función package() no definida en PKGBUILD."
-fi
+    # Paquete simple (no split)
+    if declare -f package >/dev/null; then
+        log "Ejecutando package()..."
+        (
+            export srcdir="$SRCDIR"
+            export pkgdir="$PKGDIR"
+            export startdir="$PWD"
+            cd "$pkg_context"
+            package
+        )
+    else
+        error "Función package() no definida en PKGBUILD."
+    fi
 
+    # Metadatos mínimos (formato compatible con pacman, sin makedepends)
+    log "Generando metadatos (.PKGINFO)..."
+    generate_pkginfo > "$PKGDIR/.PKGINFO"
+    log "Generando metadatos (.BUILDINFO)..."
+    generate_pkgbuild > "$PKGDIR/.BUILDINFO"
 
-# Metadatos mínimos (formato compatible con pacman, sin makedepends)
-log "Generando metadatos (.PKGINFO)..."
-generate_pkginfo > "$PKGDIR/.PKGINFO"
-log "Generando metadatos (.BUILDINFO)..."
-generate_pkgbuild > "$PKGDIR/.BUILDINFO"
-
-# .MTREE (mejor compatibilidad con pacman)
-if command -v bsdtar >/dev/null; then
-    log "Generando .MTREE..."
-    (cd "$PKGDIR" && bsdtar -czf .MTREE --format=mtree --options='!all,use-set,uid,gid,mode,time,size,sha256,link' . 2>/dev/null)
-else
-    log "Advertencia: bsdtar no encontrado. El paquete no tendrá .MTREE."
+    # .MTREE (mejor compatibilidad con pacman)
+    if command -v bsdtar >/dev/null; then
+        log "Generando .MTREE..."
+        (cd "$PKGDIR" && bsdtar -czf .MTREE --format=mtree --options='!all,use-set,uid,gid,mode,time,size,sha256,link' . 2>/dev/null)
+    else
+        log "Advertencia: bsdtar no encontrado. El paquete no tendrá .MTREE."
+    fi
 fi
 
 if [[ "$noarchive" == true ]]; then
